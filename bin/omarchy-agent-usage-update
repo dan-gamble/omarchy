@@ -39,10 +39,12 @@ wanted() {
   return 1
 }
 
+# Collectors run without the refresh lock: one that leaves a process behind
+# would otherwise hold it, and every later refresh would wait on it forever.
 collect() {
   local collector="$1" agent="$2"
   local record tmp
-  if ! record=$("$collector" "${flags[@]}") || [[ -z $record ]] || ! jq -e . >/dev/null 2>&1 <<<"$record"; then
+  if ! record=$("$collector" "${flags[@]}" {lock_fd}>&-) || [[ -z $record ]] || ! jq -e . >/dev/null 2>&1 <<<"$record"; then
     echo "omarchy-agent-usage-update: $agent collector failed" >&2
     return 1
   fi
@@ -51,44 +53,106 @@ collect() {
   mv "$tmp" "$USAGE_DIR/$agent.json"
 }
 
-# Accounts can be signed in to someone else since they were added; the
-# records name them from the registry, so bring it up to date first.
-accounts_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/accounts"
-if [[ -d $accounts_dir ]]; then
-  "$OMARCHY_PATH/bin/omarchy-agent-account-state" refresh
-fi
+refresh() {
+  # Accounts can be signed in to someone else since they were added; the
+  # records name them from the registry, so bring it up to date first.
+  local accounts_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/accounts"
+  if [[ -d $accounts_dir ]]; then
+    "$OMARCHY_PATH/bin/omarchy-agent-account-state" refresh {lock_fd}>&-
+  fi
 
-# Collectors forced together read the Codex rollouts they share once between
-# them, whenever each gets to them, by knowing when this refresh began.
-# EPOCHREALTIME uses the locale's decimal separator, a comma in many.
-export OMARCHY_AGENT_USAGE_REFRESH_AT=${EPOCHREALTIME/,/.}
+  # Collectors forced together read the Codex rollouts they share once between
+  # them, whenever each gets to them, by knowing when this refresh began.
+  # EPOCHREALTIME uses the locale's decimal separator, a comma in many.
+  export OMARCHY_AGENT_USAGE_REFRESH_AT=${EPOCHREALTIME/,/.}
 
-pids=()
+  local pids=() index pid status=0 agent switched
+  for index in "${!collectors[@]}"; do
+    collect "${collectors[index]}" "${agents[index]}" &
+    pids+=($!)
+  done
+
+  for pid in "${pids[@]}"; do
+    wait "$pid" || status=1
+  done
+
+  # Fresh limits are when switching accounts near a limit gets decided. A switch
+  # changes which account the record's own limits describe, so that record is
+  # collected once more; the limits probes it repeats are still cached.
+  for agent in claude codex grok; do
+    if wanted "$agent" && [[ -f $accounts_dir/$agent.json ]]; then
+      switched=$("$OMARCHY_PATH/bin/omarchy-agent-account-state" autoswitch "$agent" {lock_fd}>&-)
+      if [[ -n $switched ]]; then
+        flags=(--limits-only)
+        collect "$OMARCHY_PATH/bin/omarchy-agent-usage-$agent" "$agent" || status=1
+      fi
+    fi
+  done
+
+  return $status
+}
+
+# The status of the refresh that last finished, when it answers this request
+# too: it ran to the end, at least as fresh as this one asks, over every
+# collector this one wants. A lock file cut short answers nothing.
+covering_refresh_status() {
+  local held_freshness held_agents marker held_status agent
+  {
+    read -r held_freshness held_agents
+    read -r marker held_status
+  } <"$lock_file" || return 1
+  [[ $held_freshness =~ ^[0-2]$ && $marker == "done" && $held_status =~ ^[0-9]+$ ]] || return 1
+  (( held_freshness >= freshness )) || return 1
+  for agent in "${agents[@]}"; do
+    [[ " $held_agents " == *" $agent "* ]] || return 1
+  done
+  echo "$held_status"
+}
+
+collectors=()
+agents=()
 for collector in "$OMARCHY_PATH"/bin/omarchy-agent-usage-*; do
   [[ -x $collector ]] || continue
   agent="${collector##*/omarchy-agent-usage-}"
   [[ $agent == "update" ]] && continue
   wanted "$agent" || continue
-  collect "$collector" "$agent" &
-  pids+=($!)
+  collectors+=("$collector")
+  agents+=("$agent")
 done
 
-status=0
-for pid in "${pids[@]}"; do
-  wait "$pid" || status=1
+# How fresh this request wants the records: --force rereads everything, a plain
+# refresh reuses only a scan from the last seconds, and --limits-only reuses a
+# recent scan and wants fresh limits alone.
+freshness=1
+for flag in "${flags[@]}"; do
+  case $flag in
+  --force) freshness=2 ;;
+  --limits-only) (( freshness == 2 )) || freshness=0 ;;
+  esac
 done
 
-# Fresh limits are when switching accounts near a limit gets decided. A switch
-# changes which account the record's own limits describe, so that record is
-# collected once more; the limits probes it repeats are still cached.
-for agent in claude codex grok; do
-  if wanted "$agent" && [[ -f $accounts_dir/$agent.json ]]; then
-    switched=$("$OMARCHY_PATH/bin/omarchy-agent-account-state" autoswitch "$agent")
-    if [[ -n $switched ]]; then
-      flags=(--limits-only)
-      collect "$OMARCHY_PATH/bin/omarchy-agent-usage-$agent" "$agent" || status=1
-    fi
-  fi
-done
+# One refresh at a time, however many ask. The agents panel is drawn on every
+# monitor and each copy keeps its own refresh timer, so three monitors ask for
+# three refreshes at once, and side by side they would read every transcript
+# three times over. A request that finds a refresh running waits for it, then
+# takes its records when that refresh answers this one too. A refresh that died
+# before finishing answers nothing, so the request then runs its own. The lock
+# sits with the records it guards; the panel only reads *.json there.
+lock_file="$USAGE_DIR/.update.lock"
+exec {lock_fd}<>"$lock_file"
+waited=0
+if ! flock -n "$lock_fd"; then
+  waited=1
+  flock "$lock_fd"
+fi
+
+if (( waited )) && covered=$(covering_refresh_status); then
+  status=$covered
+else
+  printf '%s %s\n' "$freshness" "${agents[*]}" >"$lock_file"
+  refresh
+  status=$?
+  printf 'done %s\n' "$status" >>"$lock_file"
+fi
 
 exit $status
